@@ -87,6 +87,25 @@ async def get_jwt_token(api_url: str) -> str | None:
     
     return None
 
+def progress_bar(current: int, total: int, width: int = 20) -> str:
+    """Generate a progress bar string"""
+    if total == 0:
+        return "[" + "█" * width + "] 100%"
+    
+    percent = current / total
+    filled = int(width * percent)
+    bar = "█" * filled + "░" * (width - filled)
+    
+    # Format sizes
+    def format_size(bytes_size: float) -> str:
+        for unit in ['Б', 'КБ', 'МБ', 'ГБ']:
+            if bytes_size < 1024.0:
+                return f"{bytes_size:.1f} {unit}"
+            bytes_size /= 1024.0
+        return f"{bytes_size:.1f} ТБ"
+    
+    return f"[{bar}] {percent*100:.0f}%\n📊 {format_size(current)} / {format_size(total)}"
+
 def is_youtube_url(url: str) -> bool:
     """Check if URL is from YouTube"""
     return "youtube.com" in url or "youtu.be" in url
@@ -98,19 +117,69 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
     
     max_file_size = MAX_FILE_SIZE
     
-    # Always use single file format to avoid ffmpeg dependency issues
-    # This ensures compatibility across all systems
-    ydl_opts: dict[str, Any] = {
-        'format': 'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
-        'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
-        'quiet': True,
-        'no_warnings': True,
-        'no_abort_on_error': True,  # Don't abort on errors, try next format
-    }
+    # Progress tracking
+    progress_data = {'downloaded': 0, 'total': 0, 'status': 'starting'}
+    animation_frames = ["⚡", "⚡⚡", "⚡⚡⚡", "⚡⚡⚡⚡", "⚡⚡⚡⚡⚡"]
+    frame_idx = [0]
     
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
-        info = ydl.extract_info(url, download=True)
-        video_filename = Path(ydl.prepare_filename(info))
+    def progress_hook(d: dict[str, Any]) -> None:
+        status = d.get('status', '')
+        if status == 'downloading':
+            progress_data['downloaded'] = d.get('downloaded_bytes', 0)
+            progress_data['total'] = d.get('total_bytes') or d.get('total_bytes_estimate', 0)
+            progress_data['status'] = 'downloading'
+        elif status == 'finished':
+            progress_data['status'] = 'finished'
+    
+    # Start progress updater task
+    async def update_progress():
+        """Periodically update progress message"""
+        while True:
+            await asyncio.sleep(0.5)
+            try:
+                if progress_data['total'] > 0 and progress_data['status'] == 'downloading':
+                    # Show real progress bar
+                    progress_text = f"⏬ Завантажую YouTube відео...\n\n{progress_bar(progress_data['downloaded'], progress_data['total'])}"
+                    await status_message.edit_text(progress_text)
+                else:
+                    # Show animation while waiting for progress data
+                    frame_idx[0] = (frame_idx[0] + 1) % len(animation_frames)
+                    await status_message.edit_text(f"{animation_frames[frame_idx[0]]} Завантажую YouTube відео...")
+            except Exception as e:
+                logging.debug(f"Progress update error: {e}")
+                pass
+    
+    # Start progress updater
+    progress_task = asyncio.create_task(update_progress())
+    
+    try:
+        # Always use single file format to avoid ffmpeg dependency issues
+        # This ensures compatibility across all systems
+        ydl_opts: dict[str, Any] = {
+            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
+            'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+            'no_abort_on_error': True,  # Don't abort on errors, try next format
+            'progress_hooks': [progress_hook],
+        }
+        
+        # Run yt-dlp in thread pool to not block event loop
+        loop = asyncio.get_event_loop()
+        
+        def download():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                info = ydl.extract_info(url, download=True)
+                return Path(ydl.prepare_filename(info))
+        
+        video_filename = await loop.run_in_executor(None, download)
+    finally:
+        # Stop progress updater
+        progress_task.cancel()
+        try:
+            await progress_task
+        except asyncio.CancelledError:
+            pass
     
     # Check file size
     file_size = video_filename.stat().st_size
@@ -120,11 +189,28 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
         video_filename.unlink()
         await status_message.edit_text("📉 Файл занадто великий, завантажую у 480p...")
         
-        ydl_opts['format'] = 'best[height<=480][ext=mp4]/best[height<=480]/best[height<=360]'
+        # Reset progress data for new download
+        progress_data['downloaded'] = 0
+        progress_data['total'] = 0
         
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
-            info = ydl.extract_info(url, download=True)
-            video_filename = Path(ydl.prepare_filename(info))
+        # Start new progress updater
+        progress_task = asyncio.create_task(update_progress())
+        
+        try:
+            ydl_opts['format'] = 'best[height<=480][ext=mp4]/best[height<=480]/best[height<=360]'
+            
+            def download_lower():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                    info = ydl.extract_info(url, download=True)
+                    return Path(ydl.prepare_filename(info))
+            
+            video_filename = await loop.run_in_executor(None, download_lower)
+        finally:
+            progress_task.cancel()
+            try:
+                await progress_task
+            except asyncio.CancelledError:
+                pass
         
         file_size = video_filename.stat().st_size
         
@@ -297,24 +383,37 @@ async def video_handler(message: types.Message):
                         
                         # Check file size
                         content_length = response.headers.get("Content-Length")
-                        if content_length:
-                            file_size = int(content_length)
-                            
-                            if file_size > MAX_FILE_SIZE:
-                                limit_text = "2 ГБ" if bot_api_server else "50 МБ"
-                                await status_message.edit_text(
-                                    f"⚠️ Відео занадто велике ({file_size / (1024 * 1024):.1f} МБ).\n\n"
-                                    f"Ліміт Telegram: {limit_text}. Ось пряме посилання:\n"
-                                    f"📥 [Завантажити відео]({download_url})",
-                                    parse_mode="Markdown",
-                                    disable_web_page_preview=True
-                                )
-                                return
+                        total_size = int(content_length) if content_length else 0
                         
-                        # Download file
+                        if total_size > 0 and total_size > MAX_FILE_SIZE:
+                            limit_text = "2 ГБ" if bot_api_server else "50 МБ"
+                            await status_message.edit_text(
+                                f"⚠️ Відео занадто велике ({total_size / (1024 * 1024):.1f} МБ).\n\n"
+                                f"Ліміт Telegram: {limit_text}. Ось пряме посилання:\n"
+                                f"📥 [Завантажити відео]({download_url})",
+                                parse_mode="Markdown",
+                                disable_web_page_preview=True
+                            )
+                            return
+                        
+                        # Download file with progress
+                        downloaded = 0
+                        last_update = 0.0
+                        
                         with open(file_path, "wb") as f:
                             async for chunk in response.content.iter_chunked(8192):
                                 f.write(chunk)
+                                downloaded += len(chunk)
+                                
+                                # Update progress every 2 seconds
+                                current_time = asyncio.get_event_loop().time()
+                                if total_size > 0 and current_time - last_update >= 0.5:
+                                    last_update = current_time
+                                    progress_text = f"⏬ Завантажую файл...\n\n{progress_bar(downloaded, total_size)}"
+                                    try:
+                                        await status_message.edit_text(progress_text)
+                                    except Exception:
+                                        pass  # Ignore rate limit errors
                 
                 # Send video
                 await status_message.edit_text("📤 Відправляю відео...")
