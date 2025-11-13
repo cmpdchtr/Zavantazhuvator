@@ -98,16 +98,14 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
     
     max_file_size = MAX_FILE_SIZE
     
-    # Try downloading with quality limit
+    # Always use single file format to avoid ffmpeg dependency issues
+    # This ensures compatibility across all systems
     ydl_opts: dict[str, Any] = {
-        'format': (
-            'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/'
-            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
-        ),
+        'format': 'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
         'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
         'quiet': True,
         'no_warnings': True,
-        'merge_output_format': 'mp4',
+        'no_abort_on_error': True,  # Don't abort on errors, try next format
     }
     
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
@@ -122,10 +120,7 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
         video_filename.unlink()
         await status_message.edit_text("📉 Файл занадто великий, завантажую у 480p...")
         
-        ydl_opts['format'] = (
-            'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/'
-            'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]'
-        )
+        ydl_opts['format'] = 'best[height<=480][ext=mp4]/best[height<=480]/best[height<=360]'
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
             info = ydl.extract_info(url, download=True)
