@@ -27,8 +27,12 @@ token_str: str = token
 # Check if using local Bot API server
 bot_api_server = os.getenv("BOT_API_SERVER")
 if bot_api_server:
+    from aiogram.client.telegram import TelegramAPIServer
     from aiogram.client.session.aiohttp import AiohttpSession
-    session = AiohttpSession(api=bot_api_server)
+    
+    # Parse the API server URL
+    api_server = TelegramAPIServer.from_base(bot_api_server)
+    session = AiohttpSession(api=api_server)
     bot = Bot(token=token_str, session=session)
     logging.info(f"Using local Bot API server: {bot_api_server}")
     logging.info("File size limit: up to 2 GB")
