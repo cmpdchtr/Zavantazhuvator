@@ -43,13 +43,23 @@ async def youtube_handler(message: types.Message):
         downloads_dir = Path("downloads")
         downloads_dir.mkdir(exist_ok=True)
         
-        # Configuring yt-dlp for downloading in the best quality
+        max_file_size = 50 * 1024 * 1024  # 50 MB - Telegram limit
+        video_filename = None
+        
+        # Try downloading in best quality with original audio
         ydl_opts: dict[str, Any] = {
-            'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': (
+                'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/'
+                'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+            ),
             'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
             'merge_output_format': 'mp4',
+            'postprocessors': [{
+                'key': 'FFmpegVideoConvertor',
+                'preferedformat': 'mp4',
+            }],
         }
         
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
@@ -57,7 +67,36 @@ async def youtube_handler(message: types.Message):
             video_title = info.get('title', 'video')
             video_filename = ydl.prepare_filename(info)
         
-        # Sending the video to the user
+        # Check file size
+        file_size = os.path.getsize(video_filename)
+        
+        # If file is still too large, try 480p
+        if file_size > max_file_size:
+            os.remove(video_filename)
+            await status_message.edit_text("📉 Файл занадто великий, завантажую у 480p...")
+            
+            ydl_opts['format'] = (
+                'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/'
+                'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]/'
+                'bestvideo[ext=mp4]+bestaudio[ext=m4a]'
+            )
+            
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                info = ydl.extract_info(url, download=True)
+                video_filename = ydl.prepare_filename(info)
+            
+            file_size = os.path.getsize(video_filename)
+            
+            # If still too large, inform user
+            if file_size > max_file_size:
+                os.remove(video_filename)
+                await status_message.edit_text(
+                    f"❌ Відео занадто велике ({file_size / (1024 * 1024):.1f} МБ).\n\n"
+                    f"Telegram Bot API має ліміт 50 МБ. Спробуйте коротше відео."
+                )
+                return
+        
+        # Send the video
         video_file = FSInputFile(video_filename)
         await message.answer_video(
             video=video_file,
@@ -67,7 +106,8 @@ async def youtube_handler(message: types.Message):
         await status_message.delete()
         
         # Deleting the file after sending
-        os.remove(video_filename)
+        if video_filename and os.path.exists(video_filename):
+            os.remove(video_filename)
         
     except Exception as e:
         logging.error(f"Error downloading video: {e}")
@@ -86,9 +126,12 @@ async def tiktok_handler(message: types.Message):
         downloads_dir = Path("downloads")
         downloads_dir.mkdir(exist_ok=True)
         
+        max_file_size = 50 * 1024 * 1024  # 50 MB - Telegram limit
+        video_filename = None
+        
         # Configuring yt-dlp for TikTok downloads
         ydl_opts: dict[str, Any] = {
-            'format': 'best',
+            'format': 'best[filesize<?50M]/best',
             'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
@@ -99,7 +142,19 @@ async def tiktok_handler(message: types.Message):
             video_title = info.get('title', 'tiktok_video')
             video_filename = ydl.prepare_filename(info)
         
-        # Sending the video to the user
+        # Check file size
+        file_size = os.path.getsize(video_filename)
+        
+        # If file is too large, inform user
+        if file_size > max_file_size:
+            os.remove(video_filename)
+            await status_message.edit_text(
+                f"❌ Відео занадто велике ({file_size / (1024 * 1024):.1f} МБ).\n\n"
+                f"Telegram Bot API має ліміт 50 МБ."
+            )
+            return
+        
+        # Send the video
         video_file = FSInputFile(video_filename)
         await message.answer_video(
             video=video_file,
@@ -109,7 +164,8 @@ async def tiktok_handler(message: types.Message):
         await status_message.delete()
         
         # Deleting the file after sending
-        os.remove(video_filename)
+        if video_filename and os.path.exists(video_filename):
+            os.remove(video_filename)
         
     except Exception as e:
         logging.error(f"Error downloading TikTok video: {e}")
