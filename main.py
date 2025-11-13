@@ -9,7 +9,8 @@ from typing import Any
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters.command import Command
 from aiogram import F
-from aiogram.types import FSInputFile, URLInputFile
+from aiogram.types import FSInputFile, URLInputFile, InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.filters.callback_data import CallbackData
 from dotenv import load_dotenv
 
 # Enable logging
@@ -52,6 +53,9 @@ MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024 if bot_api_server else 50 * 1024 * 1024  
 
 # Cache for JWT tokens
 jwt_token_cache: dict[str, Any] = {}
+
+# Temporary storage for video URLs (to avoid callback_data size limits)
+video_url_storage: dict[str, str] = {}
 
 async def get_jwt_token(api_url: str) -> str | None:
     """Get JWT token from Cobalt API if required"""
@@ -110,12 +114,60 @@ def is_youtube_url(url: str) -> bool:
     """Check if URL is from YouTube"""
     return "youtube.com" in url or "youtu.be" in url
 
-async def download_youtube_video(url: str, status_message: types.Message) -> Path | None:
+class VideoDownload(CallbackData, prefix="video"):
+    """Callback data for video download buttons"""
+    quality: str
+    video_id: str
+
+class CobaltDownload(CallbackData, prefix="cobalt"):
+    """Callback data for Cobalt video download buttons"""
+    action: str  # "download" or "audio"
+    video_id: str
+
+async def get_video_info(url: str) -> dict[str, Any] | None:
+    """Get video metadata without downloading"""
+    try:
+        ydl_opts: dict[str, Any] = {
+            'quiet': True,
+            'no_warnings': True,
+            'skip_download': True,
+        }
+        
+        loop = asyncio.get_event_loop()
+        
+        def extract_info():
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                return ydl.extract_info(url, download=False)
+        
+        info = await loop.run_in_executor(None, extract_info)
+        return info  # type: ignore
+    except Exception as e:
+        logging.error(f"Error extracting video info: {e}")
+        return None
+
+async def get_cobalt_info(url: str) -> dict[str, Any] | None:
+    """Get video info from Cobalt API"""
+    try:
+        result = await download_with_cobalt(url)
+        return result
+    except Exception as e:
+        logging.error(f"Error getting Cobalt info: {e}")
+        return None
+
+async def download_youtube_video(url: str, status_message: types.Message, quality: str = "720") -> Path | None:
     """Download YouTube video using yt-dlp"""
     downloads_dir = Path("downloads")
     downloads_dir.mkdir(exist_ok=True)
     
     max_file_size = MAX_FILE_SIZE
+    
+    # Format string based on quality
+    format_map = {
+        "720": 'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
+        "480": 'best[height<=480][ext=mp4]/best[height<=480]/best',
+        "360": 'best[height<=360][ext=mp4]/best[height<=360]/best',
+    }
+    format_string = format_map.get(quality, format_map["720"])
     
     # Progress tracking
     progress_data = {'downloaded': 0, 'total': 0, 'status': 'starting'}
@@ -156,7 +208,7 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
         # Always use single file format to avoid ffmpeg dependency issues
         # This ensures compatibility across all systems
         ydl_opts: dict[str, Any] = {
-            'format': 'best[height<=720][ext=mp4]/best[height<=720]/best[ext=mp4]/best',
+            'format': format_string,
             'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
             'quiet': True,
             'no_warnings': True,
@@ -297,29 +349,195 @@ async def video_handler(message: types.Message):
     
     # Check if it's YouTube - use yt-dlp
     if is_youtube_url(url):
-        status_message = await message.answer("⚡ Завантажую YouTube відео...")
+        # Get video info first
+        status_message = await message.answer("🔍 Отримую інформацію про відео...")
+        video_info = await get_video_info(url)
         
-        try:
-            video_path = await download_youtube_video(url, status_message)
-            
-            if video_path and video_path.exists():
-                await status_message.edit_text("📤 Відправляю відео...")
-                video_file = FSInputFile(video_path)
-                await message.answer_video(video=video_file)
+        if not video_info:
+            await status_message.edit_text("❌ Не вдалося отримати інформацію про відео.")
+            return
+        
+        # Extract metadata
+        title = video_info.get('title', 'Невідома назва')
+        duration = video_info.get('duration', 0)
+        uploader = video_info.get('uploader', 'Невідомий автор')
+        view_count = video_info.get('view_count', 0)
+        thumbnail = video_info.get('thumbnail')
+        
+        # Format duration
+        duration_str = f"{duration // 60}:{duration % 60:02d}" if duration else "N/A"
+        
+        # Format view count
+        if view_count >= 1_000_000:
+            views_str = f"{view_count / 1_000_000:.1f}M"
+        elif view_count >= 1_000:
+            views_str = f"{view_count / 1_000:.1f}K"
+        else:
+            views_str = str(view_count)
+        
+        # Create preview message
+        preview_text = (
+            f"🎬 <b>{title}</b>\n\n"
+            f"👤 Автор: {uploader}\n"
+            f"⏱ Тривалість: {duration_str}\n"
+            f"👁 Перегляди: {views_str}\n\n"
+            f"Оберіть якість завантаження:"
+        )
+        
+        # Generate unique video ID and store URL
+        import hashlib
+        video_id = hashlib.md5(url.encode()).hexdigest()[:16]
+        video_url_storage[video_id] = url
+        
+        # Create quality selection buttons
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎥 720p", callback_data=VideoDownload(quality="720", video_id=video_id).pack()),
+                InlineKeyboardButton(text="📹 480p", callback_data=VideoDownload(quality="480", video_id=video_id).pack()),
+            ],
+            [
+                InlineKeyboardButton(text="📱 360p", callback_data=VideoDownload(quality="360", video_id=video_id).pack()),
+                InlineKeyboardButton(text="🎵 Audio", callback_data=VideoDownload(quality="audio", video_id=video_id).pack()),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")
+            ]
+        ])
+        
+        # Send preview with thumbnail if available
+        if thumbnail:
+            try:
+                await message.answer_photo(
+                    photo=thumbnail,
+                    caption=preview_text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
                 await status_message.delete()
-                
-                # Clean up
-                video_path.unlink()
-        except Exception as e:
-            logging.error(f"Error downloading YouTube video: {e}")
-            await status_message.edit_text(
-                f"❌ Помилка при завантаженні YouTube відео: {str(e)}\n\n"
-                f"Спробуйте інше посилання."
-            )
+            except Exception:
+                # Fallback to text if thumbnail fails
+                await status_message.edit_text(preview_text, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await status_message.edit_text(preview_text, reply_markup=keyboard, parse_mode="HTML")
+        
         return
     
+
+    
     # For other platforms, use Cobalt API
-    status_message = await message.answer("⚡ Завантажую відео через Cobalt API...")
+    status_message = await message.answer("🔍 Отримую інформацію про відео...")
+    
+    # Get info from Cobalt
+    result = await get_cobalt_info(url)
+    
+    if not result:
+        await status_message.edit_text("❌ Не вдалося отримати інформацію. Перевірте посилання.")
+        return
+    
+    status = result.get("status")
+    
+    # Handle picker (multiple items) differently - no preview
+    if status == "picker":
+        picker_items = result.get("picker", [])
+        await status_message.edit_text(f"🎬 Знайдено {len(picker_items)} елементів. Завантажую...")
+        
+        for item in picker_items[:10]:  # Limit to 10 items
+            item_url = item.get("url")
+            if item_url:
+                try:
+                    if item.get("type") == "photo":
+                        await message.answer_photo(photo=item_url)
+                    else:
+                        await message.answer_video(video=URLInputFile(item_url))
+                except Exception as e:
+                    logging.error(f"Error sending picker item: {e}")
+                    continue
+        
+        await status_message.delete()
+        return
+    
+    # For single video, show preview
+    if status in ["tunnel", "redirect"]:
+        # Generate unique video ID and store URL
+        import hashlib
+        video_id = hashlib.md5(url.encode()).hexdigest()[:16]
+        video_url_storage[video_id] = url
+        
+        # Try to get thumbnail from result
+        thumbnail = result.get("thumbnail")
+        filename = result.get("filename", "Відео")
+        
+        # Create preview text
+        preview_text = (
+            f"🎬 <b>{filename}</b>\n\n"
+            f"📹 Платформа: {url.split('/')[2]}\n\n"
+            f"Оберіть дію:"
+        )
+        
+        # Create action buttons
+        keyboard = InlineKeyboardMarkup(inline_keyboard=[
+            [
+                InlineKeyboardButton(text="🎥 Завантажити відео", callback_data=CobaltDownload(action="download", video_id=video_id).pack()),
+            ],
+            [
+                InlineKeyboardButton(text="🎵 Тільки аудіо", callback_data=CobaltDownload(action="audio", video_id=video_id).pack()),
+            ],
+            [
+                InlineKeyboardButton(text="❌ Скасувати", callback_data="cancel")
+            ]
+        ])
+        
+        # Send preview with thumbnail if available
+        if thumbnail:
+            try:
+                await message.answer_photo(
+                    photo=thumbnail,
+                    caption=preview_text,
+                    reply_markup=keyboard,
+                    parse_mode="HTML"
+                )
+                await status_message.delete()
+            except Exception:
+                await status_message.edit_text(preview_text, reply_markup=keyboard, parse_mode="HTML")
+        else:
+            await status_message.edit_text(preview_text, reply_markup=keyboard, parse_mode="HTML")
+        
+        return
+    
+    # Handle errors
+    if status == "error":
+        error_code = result.get("error", {}).get("code", "unknown")
+        await status_message.edit_text(f"❌ Помилка: {error_code}\n\nПеревірте посилання.")
+        return
+    
+    # Unsupported status
+    await status_message.edit_text(f"❌ Непідтримуваний тип: {status}")
+
+@dp.callback_query(CobaltDownload.filter())
+async def cobalt_callback_handler(callback: types.CallbackQuery, callback_data: CobaltDownload):
+    """Handle Cobalt download callback"""
+    await callback.answer()
+    
+    action = callback_data.action
+    video_id = callback_data.video_id
+    
+    # Retrieve URL from storage
+    url = video_url_storage.get(video_id)
+    if not url:
+        await callback.answer("❌ Посилання застаріло. Надішліть його знову.", show_alert=True)
+        if callback.message and hasattr(callback.message, 'delete'):
+            await callback.message.delete()  # type: ignore
+        return
+    
+    # Delete preview message
+    if callback.message and hasattr(callback.message, 'delete'):
+        await callback.message.delete()  # type: ignore
+    
+    # Send status message
+    status_message = await bot.send_message(
+        callback.from_user.id,
+        "⚡ Завантажую відео..."
+    )
     
     try:
         # Get download info from Cobalt API
@@ -341,9 +559,9 @@ async def video_handler(message: types.Message):
                 if item_url:
                     try:
                         if item.get("type") == "photo":
-                            await message.answer_photo(photo=item_url)
+                            await bot.send_photo(callback.from_user.id, photo=item_url)
                         else:
-                            await message.answer_video(video=URLInputFile(item_url))
+                            await bot.send_video(callback.from_user.id, video=URLInputFile(item_url))
                     except Exception as e:
                         logging.error(f"Error sending picker item: {e}")
                         continue
@@ -352,9 +570,16 @@ async def video_handler(message: types.Message):
             return
         
         if status in ["tunnel", "redirect"]:
-            # Single video/audio file
-            download_url = result.get("url")
-            filename = result.get("filename", "video.mp4")
+            # Check if user wants audio only
+            if action == "audio":
+                # Re-request with audio quality
+                audio_result = await download_with_cobalt(url)
+                download_url = audio_result.get("url")
+                filename = "audio.m4a"
+            else:
+                # Single video/audio file
+                download_url = result.get("url")
+                filename = result.get("filename", "video.mp4")
             
             if not download_url:
                 await status_message.edit_text("❌ Не вдалося отримати посилання на завантаження.")
@@ -415,15 +640,24 @@ async def video_handler(message: types.Message):
                                     except Exception:
                                         pass  # Ignore rate limit errors
                 
-                # Send video
-                await status_message.edit_text("📤 Відправляю відео...")
-                video_file = FSInputFile(file_path)
-                await message.answer_video(video=video_file)
+                # Send video or audio
+                if action == "audio":
+                    await status_message.edit_text("📤 Відправляю аудіо...")
+                    audio_file = FSInputFile(file_path)
+                    await bot.send_audio(callback.from_user.id, audio=audio_file)
+                else:
+                    await status_message.edit_text("📤 Відправляю відео...")
+                    video_file = FSInputFile(file_path)
+                    await bot.send_video(callback.from_user.id, video=video_file)
                 await status_message.delete()
                 
                 # Clean up
                 if file_path.exists():
                     file_path.unlink()
+                
+                # Remove URL from storage
+                if video_id in video_url_storage:
+                    del video_url_storage[video_id]
                     
             except Exception as e:
                 logging.error(f"Error downloading/sending video: {e}")
@@ -448,6 +682,99 @@ async def video_handler(message: types.Message):
             f"❌ Помилка при завантаженні: {str(e)}\n\n"
             f"Можливо, платформа не підтримується або посилання неправильне."
         )
+        # Remove URL from storage on error
+        if video_id in video_url_storage:
+            del video_url_storage[video_id]
+
+@dp.callback_query(VideoDownload.filter())
+async def quality_callback_handler(callback: types.CallbackQuery, callback_data: VideoDownload):
+    """Handle quality selection callback"""
+    await callback.answer()
+    
+    quality = callback_data.quality
+    video_id = callback_data.video_id
+    
+    # Retrieve URL from storage
+    url = video_url_storage.get(video_id)
+    if not url:
+        await callback.answer("❌ Посилання застаріло. Надішліть його знову.", show_alert=True)
+        if callback.message and hasattr(callback.message, 'delete'):
+            await callback.message.delete()  # type: ignore
+        return
+    
+    # Delete preview message
+    if callback.message and hasattr(callback.message, 'delete'):
+        await callback.message.delete()  # type: ignore
+    
+    # Send status message
+    status_message = await bot.send_message(
+        callback.from_user.id,
+        f"⚡ Завантажую YouTube відео ({quality})..."
+    )
+    
+    try:
+        # Prepare download with selected quality
+        if quality == "audio":
+            # Download audio only
+            downloads_dir = Path("downloads")
+            downloads_dir.mkdir(exist_ok=True)
+            
+            ydl_opts: dict[str, Any] = {
+                'format': 'bestaudio[ext=m4a]/bestaudio',
+                'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
+                'quiet': True,
+                'no_warnings': True,
+            }
+            
+            loop = asyncio.get_event_loop()
+            
+            def download_audio():
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+                    info = ydl.extract_info(url, download=True)
+                    return Path(ydl.prepare_filename(info))
+            
+            audio_path = await loop.run_in_executor(None, download_audio)
+            
+            await status_message.edit_text("📤 Відправляю аудіо...")
+            audio_file = FSInputFile(audio_path)
+            await bot.send_audio(callback.from_user.id, audio=audio_file)
+            await status_message.delete()
+            
+            # Clean up
+            if audio_path.exists():
+                audio_path.unlink()
+        else:
+            # Download video with selected quality
+            video_path = await download_youtube_video(url, status_message, quality)
+            
+            if video_path and video_path.exists():
+                await status_message.edit_text("📤 Відправляю відео...")
+                video_file = FSInputFile(video_path)
+                await bot.send_video(callback.from_user.id, video=video_file)
+                await status_message.delete()
+                
+                # Clean up
+                video_path.unlink()
+        
+        # Remove URL from storage after successful download
+        if video_id in video_url_storage:
+            del video_url_storage[video_id]
+            
+    except Exception as e:
+        logging.error(f"Error downloading video: {e}")
+        await status_message.edit_text(
+            f"❌ Помилка: {str(e)}\n\nСпробуйте інше посилання."
+        )
+        # Remove URL from storage on error too
+        if video_id in video_url_storage:
+            del video_url_storage[video_id]
+
+@dp.callback_query(F.data == "cancel")
+async def cancel_callback_handler(callback: types.CallbackQuery):
+    """Handle cancel button"""
+    await callback.answer("Скасовано")
+    if callback.message and hasattr(callback.message, 'delete'):
+        await callback.message.delete()  # type: ignore
 
 # Reacting to all other messages
 @dp.message(F.text)
