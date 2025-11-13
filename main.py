@@ -23,12 +23,28 @@ token = os.getenv("BOT_TOKEN")
 if token is None:
     raise RuntimeError("BOT_TOKEN environment variable is not set")
 token_str: str = token
-bot = Bot(token=token_str)
+
+# Check if using local Bot API server
+bot_api_server = os.getenv("BOT_API_SERVER")
+if bot_api_server:
+    from aiogram.client.session.aiohttp import AiohttpSession
+    session = AiohttpSession(api=bot_api_server)
+    bot = Bot(token=token_str, session=session)
+    logging.info(f"Using local Bot API server: {bot_api_server}")
+    logging.info("File size limit: up to 2 GB")
+else:
+    bot = Bot(token=token_str)
+    logging.info("Using official Telegram Bot API")
+    logging.info("File size limit: 50 MB")
+
 dp = Dispatcher()
 
 # Cobalt API configuration
 COBALT_API_URL = os.getenv("COBALT_API_URL", "https://co.wuk.sh")
 COBALT_API_KEY = os.getenv("COBALT_API_KEY")  # Optional API key for authentication
+
+# File size limits
+MAX_FILE_SIZE = 2 * 1024 * 1024 * 1024 if bot_api_server else 50 * 1024 * 1024  # 2 GB or 50 MB
 
 # Cache for JWT tokens
 jwt_token_cache: dict[str, Any] = {}
@@ -76,7 +92,7 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
     downloads_dir = Path("downloads")
     downloads_dir.mkdir(exist_ok=True)
     
-    max_file_size = 50 * 1024 * 1024  # 50 MB
+    max_file_size = MAX_FILE_SIZE
     
     # Try downloading with quality limit
     ydl_opts: dict[str, Any] = {
@@ -116,9 +132,10 @@ async def download_youtube_video(url: str, status_message: types.Message) -> Pat
         # If still too large, inform user
         if file_size > max_file_size:
             video_filename.unlink()
+            limit_text = "2 ГБ" if bot_api_server else "50 МБ"
             await status_message.edit_text(
                 f"❌ Відео занадто велике ({file_size / (1024 * 1024):.1f} МБ).\n\n"
-                f"Telegram має ліміт 50 МБ. Спробуйте коротше відео."
+                f"Ліміт Telegram: {limit_text}. Спробуйте коротше відео."
             )
             return None
     
@@ -165,6 +182,9 @@ async def download_with_cobalt(url: str) -> dict[str, Any]:
 # /start handler
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
+    file_limit = "2 ГБ 🚀" if bot_api_server else "50 МБ"
+    api_status = "Локальний Bot API Server" if bot_api_server else "Офіційний Telegram API"
+    
     welcome_text = (
         "🎬 Zavantazhuvator — твій універсальний відео помічник!\n\n"
         "Завантажуй відео з YouTube, TikTok, Instagram, Twitter, Reddit та багатьох інших платформ "
@@ -175,6 +195,8 @@ async def cmd_start(message: types.Message):
         "• Інші платформи: до 4K/8K (Cobalt API)\n"
         "• Блискавична швидкість завантаження\n"
         "• Оригінальна аудіодоріжка без перекладу\n\n"
+        f"📊 Статус: {api_status}\n"
+        f"📦 Ліміт файлів: {file_limit}\n\n"
         "Просто надішли посилання на відео!\n\n"
         "🤫 Більше крутих ботів у @cmpdchtr_bots"
     )
@@ -274,16 +296,16 @@ async def video_handler(message: types.Message):
                         if response.status != 200:
                             raise Exception(f"Failed to download: HTTP {response.status}")
                         
-                        # Check file size (50 MB limit)
+                        # Check file size
                         content_length = response.headers.get("Content-Length")
                         if content_length:
                             file_size = int(content_length)
-                            max_size = 50 * 1024 * 1024  # 50 MB
                             
-                            if file_size > max_size:
+                            if file_size > MAX_FILE_SIZE:
+                                limit_text = "2 ГБ" if bot_api_server else "50 МБ"
                                 await status_message.edit_text(
                                     f"⚠️ Відео занадто велике ({file_size / (1024 * 1024):.1f} МБ).\n\n"
-                                    f"Telegram має ліміт 50 МБ. Ось пряме посилання:\n"
+                                    f"Ліміт Telegram: {limit_text}. Ось пряме посилання:\n"
                                     f"📥 [Завантажити відео]({download_url})",
                                     parse_mode="Markdown",
                                     disable_web_page_preview=True
