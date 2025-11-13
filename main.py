@@ -37,7 +37,7 @@ async def youtube_handler(message: types.Message):
         return
     
     url = message.text.strip()
-    await message.answer("⏳ Завантажую відео, будь ласка, зачекайте...")
+    status_message = await message.answer("⏳ Завантажую відео, будь ласка, зачекайте...")
     
     try:
         downloads_dir = Path("downloads")
@@ -61,8 +61,10 @@ async def youtube_handler(message: types.Message):
         video_file = FSInputFile(video_filename)
         await message.answer_video(
             video=video_file,
-            caption=f"✅ {video_title}"
         )
+        
+        # Deleting the status message
+        await status_message.delete()
         
         # Deleting the file after sending
         os.remove(video_filename)
@@ -71,10 +73,52 @@ async def youtube_handler(message: types.Message):
         logging.error(f"Error downloading video: {e}")
         await message.answer(f"❌ Помилка при завантаженні відео: {str(e)}\n\nСпробуйте інше посилання або повторіть спробу пізніше.")
 
+# Reacting to messages with TikTok links
+@dp.message(F.text.contains("tiktok.com") | F.text.contains("vm.tiktok.com"))
+async def tiktok_handler(message: types.Message):
+    if message.text is None:
+        return
+    
+    url = message.text.strip()
+    status_message = await message.answer("⏳ Завантажую TikTok відео, будь ласка, зачекайте...")
+    
+    try:
+        downloads_dir = Path("downloads")
+        downloads_dir.mkdir(exist_ok=True)
+        
+        # Configuring yt-dlp for TikTok downloads
+        ydl_opts: dict[str, Any] = {
+            'format': 'best',
+            'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
+            'quiet': True,
+            'no_warnings': True,
+        }
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+            info = ydl.extract_info(url, download=True)
+            video_title = info.get('title', 'tiktok_video')
+            video_filename = ydl.prepare_filename(info)
+        
+        # Sending the video to the user
+        video_file = FSInputFile(video_filename)
+        await message.answer_video(
+            video=video_file,
+        )
+        
+        # Deleting the status message
+        await status_message.delete()
+        
+        # Deleting the file after sending
+        os.remove(video_filename)
+        
+    except Exception as e:
+        logging.error(f"Error downloading TikTok video: {e}")
+        await message.answer(f"❌ Помилка при завантаженні TikTok відео: {str(e)}\n\nСпробуйте інше посилання або повторіть спробу пізніше.")
+
 # Reacting to all other messages
 @dp.message(F.text)
 async def other_handler(message: types.Message):
-    await message.answer("❌ Надішліть посилання на YouTube відео.")
+    await message.answer("❌ Надішліть посилання на YouTube або TikTok відео.")
 
 async def main():
     await dp.start_polling(bot)
