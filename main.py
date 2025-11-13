@@ -2,6 +2,7 @@ import asyncio
 import logging
 import os
 import aiohttp
+import yt_dlp
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,63 @@ async def get_jwt_token(api_url: str) -> str | None:
     
     return None
 
+def is_youtube_url(url: str) -> bool:
+    """Check if URL is from YouTube"""
+    return "youtube.com" in url or "youtu.be" in url
+
+async def download_youtube_video(url: str, status_message: types.Message) -> Path | None:
+    """Download YouTube video using yt-dlp"""
+    downloads_dir = Path("downloads")
+    downloads_dir.mkdir(exist_ok=True)
+    
+    max_file_size = 50 * 1024 * 1024  # 50 MB
+    
+    # Try downloading with quality limit
+    ydl_opts: dict[str, Any] = {
+        'format': (
+            'bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]/best[height<=720][ext=mp4]/'
+            'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best'
+        ),
+        'outtmpl': str(downloads_dir / '%(title)s.%(ext)s'),
+        'quiet': True,
+        'no_warnings': True,
+        'merge_output_format': 'mp4',
+    }
+    
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+        info = ydl.extract_info(url, download=True)
+        video_filename = Path(ydl.prepare_filename(info))
+    
+    # Check file size
+    file_size = video_filename.stat().st_size
+    
+    # If too large, try lower quality
+    if file_size > max_file_size:
+        video_filename.unlink()
+        await status_message.edit_text("📉 Файл занадто великий, завантажую у 480p...")
+        
+        ydl_opts['format'] = (
+            'bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]/best[height<=480][ext=mp4]/'
+            'bestvideo[height<=360][ext=mp4]+bestaudio[ext=m4a]/best[height<=360][ext=mp4]'
+        )
+        
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:  # type: ignore
+            info = ydl.extract_info(url, download=True)
+            video_filename = Path(ydl.prepare_filename(info))
+        
+        file_size = video_filename.stat().st_size
+        
+        # If still too large, inform user
+        if file_size > max_file_size:
+            video_filename.unlink()
+            await status_message.edit_text(
+                f"❌ Відео занадто велике ({file_size / (1024 * 1024):.1f} МБ).\n\n"
+                f"Telegram має ліміт 50 МБ. Спробуйте коротше відео."
+            )
+            return None
+    
+    return video_filename
+
 async def download_with_cobalt(url: str) -> dict[str, Any]:
     """Download video using Cobalt API"""
     headers = {
@@ -113,7 +171,8 @@ async def cmd_start(message: types.Message):
         "у найкращій якості за лічені секунди!\n\n"
         "✨ Можливості:\n"
         "• Підтримка 20+ популярних платформ\n"
-        "• Якість відео: до 4K/8K\n"
+        "• YouTube: до 1080p з оригінальним аудіо (yt-dlp)\n"
+        "• Інші платформи: до 4K/8K (Cobalt API)\n"
         "• Блискавична швидкість завантаження\n"
         "• Оригінальна аудіодоріжка без перекладу\n\n"
         "Просто надішли посилання на відео!\n\n"
@@ -121,13 +180,38 @@ async def cmd_start(message: types.Message):
     )
     await message.answer(welcome_text)
 
-# Universal video handler - detects URLs and downloads using Cobalt
+# Universal video handler - detects URLs and downloads using Cobalt or yt-dlp
 @dp.message(F.text.regexp(r'https?://'))
 async def video_handler(message: types.Message):
     if message.text is None:
         return
     
     url = message.text.strip()
+    
+    # Check if it's YouTube - use yt-dlp
+    if is_youtube_url(url):
+        status_message = await message.answer("⚡ Завантажую YouTube відео...")
+        
+        try:
+            video_path = await download_youtube_video(url, status_message)
+            
+            if video_path and video_path.exists():
+                await status_message.edit_text("📤 Відправляю відео...")
+                video_file = FSInputFile(video_path)
+                await message.answer_video(video=video_file)
+                await status_message.delete()
+                
+                # Clean up
+                video_path.unlink()
+        except Exception as e:
+            logging.error(f"Error downloading YouTube video: {e}")
+            await status_message.edit_text(
+                f"❌ Помилка при завантаженні YouTube відео: {str(e)}\n\n"
+                f"Спробуйте інше посилання."
+            )
+        return
+    
+    # For other platforms, use Cobalt API
     status_message = await message.answer("⚡ Завантажую відео через Cobalt API...")
     
     try:
